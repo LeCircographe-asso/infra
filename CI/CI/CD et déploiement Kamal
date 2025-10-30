@@ -1,0 +1,8 @@
+# CI/CD et déploiement Kamal — Organisation à 2 dépôts (core + deployment)
+
+## Vue d’ensemble
+
+- core (Rails app)
+  - Tag/release → Build image → Push registry → Envoie un event vers le repo infra
+- deployment (infra)
+  - Reçoit l’event + tag → Déploie via Kamal sur staging/prod
