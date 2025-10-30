@@ -6,3 +6,130 @@
   - Tag/release → Build image → Push registry → Envoie un event vers le repo infra
 - deployment (infra)
   - Reçoit l’event + tag → Déploie via Kamal sur staging/prod
+
+
+## Nomination des tags
+- Staging: `staging-YYYYMMDD-HHMM` (ex: `staging-20251030-2030`)
+- Production: `vX.Y.Z` (ex: `v1.3.0`)
+
+## Secrets et variables (GitHub)
+- core (Secrets): `REGISTRY_HOST`, `REGISTRY_USER`, `REGISTRY_TOKEN`, `DEPLOYMENT_REPO_TOKEN`
+- core (Vars): `IMAGE_NAME`
+- deployment (Secrets): `SSH_PRIVATE_KEY`, `REGISTRY_HOST`, `REGISTRY_USER`, `REGISTRY_TOKEN`, `RAILS_MASTER_KEY` (et/ou `RAILS_MASTER_KEY_STAGING`)
+- Option: utiliser des Environments `staging` / `production` pour isoler et approuver.
+
+## Workflow côté core (build image + dispatch)
+
+Fichier: `core/.github/workflows/build.yml`
+
+```yaml
+name: Build Image
+on:
+  push:
+    tags: [ 'v*', 'staging-*' ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login registry
+        run: echo "$REGISTRY_TOKEN" | docker login -u "$REGISTRY_USER" --password-stdin $REGISTRY_HOST
+        env:
+          REGISTRY_HOST: ${{ secrets.REGISTRY_HOST }}
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Build & push
+        run: |
+          TAG=${GITHUB_REF_NAME}
+          docker build -t $REGISTRY_HOST/$IMAGE_NAME:$TAG .
+          docker push $REGISTRY_HOST/$IMAGE_NAME:$TAG
+        env:
+          REGISTRY_HOST: ${{ secrets.REGISTRY_HOST }}
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+
+      - name: Notify deployment repo
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.DEPLOYMENT_REPO_TOKEN }}
+          repository: org/deployment
+          event-type: deploy
+          client-payload: '{"tag":"'"${{ github.ref_name }}"'"}'
+```
+
+## Workflow côté deployment (déployer avec Kamal)
+
+Fichier: `deployment/.github/workflows/deploy.yml`
+
+```yaml
+name: Kamal Deploy
+on:
+  repository_dispatch:
+    types: [ deploy ]
+
+jobs:
+  decide-env:
+    runs-on: ubuntu-latest
+    outputs:
+      envname: ${{ steps.pick.outputs.envname }}
+    steps:
+      - id: pick
+        run: |
+          TAG='${{ github.event.client_payload.tag }}'
+          if [[ "$TAG" == staging-* ]]; then
+            echo "envname=staging" >> $GITHUB_OUTPUT
+          else
+            echo "envname=production" >> $GITHUB_OUTPUT
+          fi
+
+  deploy:
+    needs: decide-env
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Login registry
+        run: echo "$REGISTRY_TOKEN" | docker login -u "$REGISTRY_USER" --password-stdin $REGISTRY_HOST
+        env:
+          REGISTRY_HOST: ${{ secrets.REGISTRY_HOST }}
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Deploy with Kamal
+        run: |
+          TAG='${{ github.event.client_payload.tag }}'
+          if [ "${{ needs.decide-env.outputs.envname }}" = "staging" ]; then
+            CONF=kamal.staging.yml
+          else
+            CONF=kamal.production.yml
+          fi
+          kamal -c $CONF env push
+          kamal -c $CONF deploy --version "$TAG"
+        env:
+          KAMAL_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_TOKEN }}
+          RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
+```
+
+## Fichiers Kamal (dans repo deployment)
+- `kamal.staging.yml`: hôtes staging, env vars staging, healthchecks, image registry
+- `kamal.production.yml`: idem pour production
+
+Astuce: garder la même structure, seul le bloc `servers`, `env`, et éventuellement la taille de déploiement changent.
+
+## Checklists
+- Tags: `staging-*` → staging; `v*` → production
+- Secrets/vars bien peuplés dans chaque repo
+- `RAILS_MASTER_KEY` correspond au bon `credentials.yml.enc` déployé
+- Accès SSH OK (clé deploy sur VPS)
+- Registry accessible depuis le runner GitHub ET depuis les serveurs
+
+## Dépannage
+- “Unauthorized” au push/pull: vérifier `REGISTRY_USER/TOKEN` et nom d’image
+- Kamal “cannot connect via SSH”: vérifier IP/port/clé + `known_hosts` (ssh-agent)
+- Déploiement ne se lance pas: vérifier l’event `repository_dispatch` reçu (onglet Actions du repo deployment)
